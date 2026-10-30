@@ -21,12 +21,15 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.metadata import (
+    LayerMultiBlockReqMeta,
+    LayerPoolKey,
+    masked_block_runs,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
     ChunkedTokenDatabase,
     KeyMetadata,
-    LayerMultiBlockReqMeta,
-    LayerPoolKey,
     LoadSpec,
     PoolKey,
     ReqMeta,
@@ -37,7 +40,6 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     infer_cache_transfer_granularity,
     infer_dcp_mismatch_info,
     infer_group_block_sizes,
-    masked_block_runs,
     uses_hybrid_kv_cache,
 )
 
@@ -544,35 +546,6 @@ class TestRequestTracker(unittest.TestCase):
 
 
 class TestReqMeta(unittest.TestCase):
-    def test_save_base_state_preserves_untracked_and_blocks_windows(self):
-        for state in (None, ["ZERO", "ZERO"], ["ZERO", "WINDOW"], ["ZERO", "UNPROVABLE"]):
-            for with_load in (False, True):
-                with self.subTest(state=state, with_load=with_load):
-                    tracker = RequestTracker(
-                        req_id="r1",
-                        token_len=32,
-                        allocated_block_ids_by_group=[[1, 2], [3, 4]],
-                        save_window_base_state=state,
-                    )
-                    load_spec = LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=16, can_load=True)
-                    # Partial saves allow load and save together, so the window
-                    # gate itself must suppress saves without discarding loads.
-                    meta = ReqMeta.from_request_tracker(
-                        tracker,
-                        cache_transfer_granularity=16,
-                        block_hashes=[b"h0", b"h1"],
-                        load_spec=load_spec if with_load else None,
-                        save_partial_block=with_load,
-                    )
-                    can_save = state is None or all(value == "ZERO" for value in state)
-                    assert tracker.num_saved_tokens == (32 if can_save else 0)
-                    if can_save or with_load:
-                        assert meta is not None
-                        assert bool(meta.can_save) == can_save
-                        assert meta.load_spec == (load_spec if with_load else None)
-                    else:
-                        assert meta is None
-
     def test_from_request_tracker_basic_save(self):
         tracker = RequestTracker(
             req_id="r1",

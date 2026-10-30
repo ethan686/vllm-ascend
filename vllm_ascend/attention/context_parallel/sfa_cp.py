@@ -41,11 +41,12 @@ from vllm_ascend.attention.sfa_v1 import (
 )
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
-    enable_dcp,
+    is_dcp_enabled,
     split_decodes_and_prefills,
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
+from vllm_ascend.ops.triton.dcp.sfa_dcp_query import prepare_query_head_major, unpack_query
 from vllm_ascend.ops.triton.pcp_kv_cache import copy_pcp_kv_cache
 from vllm_ascend.quantization.methods import AscendLinearScheme
 from vllm_ascend.utils import (
@@ -369,9 +370,20 @@ class AscendSFAPCPImpl(OProjWeightSwitchMixin, AscendSFAImpl):
         num_replicated_tokens = get_pcp_num_replicated_tokens(
             attn_metadata.num_decode_tokens or 0, self.is_pcp_decode_sharded
         )
-        (kv_no_split, cos, sin), slots = _gather_prefill_cache_inputs(
-            (kv_no_split, cos, sin), slots, num_replicated_tokens
-        )
+        if self.qk_rope_head_dim == 0:
+            # NoPE projects only the actual local tokens, while PCP slots keep
+            # the padded rank stride. Keep KV and slots in the same gather
+            # order: scatter writes do not require causal token order.
+            pad_tokens = attn_metadata.num_input_tokens - kv_no_split.shape[0]
+            if pad_tokens < 0:
+                raise ValueError("SFA PCP KV exceeds the rank-local padded token count.")
+            if pad_tokens:
+                kv_no_split = nn.functional.pad(kv_no_split, (0, 0, 0, pad_tokens))
+            (kv_no_split,), slots = _gather_prefill_cache_inputs((kv_no_split,), slots, num_replicated_tokens)
+        else:
+            (kv_no_split, cos, sin), slots = _gather_prefill_cache_inputs(
+                (kv_no_split, cos, sin), slots, num_replicated_tokens
+            )
         assert slots.numel() == kv_no_split.shape[0], (
             "SFA PCP cache write requires one slot per gathered token: "
             f"tokens={kv_no_split.shape[0]}, slots={slots.numel()}."
@@ -420,6 +432,7 @@ class DCPGatherContext(NamedTuple):
     handle: torch.distributed.Work | None
     restore_perm: tuple[int, ...] | None
     split_sizes: tuple[int, ...]
+    query_prepared: bool = False
 
 
 @dataclass
@@ -916,7 +929,7 @@ class AscendSFADCPMetadataBuilder(
             metadata_cls,
             supports_dcp_with_varlen,
         )
-        self.dcp_enabled = enable_dcp()
+        self.use_dcp = is_dcp_enabled()
         self.cp_kv_cache_interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
         assert self.dcp_size > 1, "AscendSFADCPMetadataBuilder requires DCP world size > 1."
         if self.cp_kv_cache_interleave_size <= 0:
@@ -1136,7 +1149,7 @@ class AscendSFADCPMetadataBuilder(
             common_attn_metadata,
             decode_threshold=self.decode_threshold,
             treat_short_extends_as_decodes=(
-                self.dcp_enabled and is_pd_decode_recompute_scheduler_enabled(self.vllm_config)
+                self.use_dcp and is_pd_decode_recompute_scheduler_enabled(self.vllm_config)
             ),
         )
         kv_gather_block_ids = None
@@ -1328,6 +1341,10 @@ class AscendSFAPCPDCPMetadataBuilder(AscendSFADCPMetadataBuilder):
                 local_slots = torch.cat((rank_slots[0, :num_decode_tokens], local_slots[num_decode_tokens:]))
             metadata.pcp_prolog_local_slots = local_slots
             metadata.pcp_prolog_global_slots = rank_slots[:, num_decode_tokens:].reshape(-1)
+            # Native KV gather keeps one decode prefix before all prefill rows.
+            metadata.slot_mapping = metadata.pcp_prolog_global_slots
+            if num_decode_tokens:
+                metadata.slot_mapping = torch.cat((rank_slots[0, :num_decode_tokens], metadata.slot_mapping))
         return metadata
 
 
@@ -1487,6 +1504,8 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
     ) -> tuple[torch.Tensor, ...]:
         if context.handle is not None:
             context.handle.wait()
+        if context.query_prepared and not keep_view:
+            return unpack_query(context.gathered, context.split_sizes)
         gathered = context.gathered
         if context.restore_perm is not None:
             gathered = gathered.permute(context.restore_perm)
@@ -1639,6 +1658,28 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
                 split_sizes=(ql_nope.shape[-1], q_pe.shape[-1]),
             )
 
+        # Decode-only callers reach this method; PCP+DCP keeps
+        # its separate TP-group override and DSA-CP gathers tokens on dim 0.
+        nope_dim, rope_dim = ql_nope.shape[-1], q_pe.shape[-1]
+        if (
+            query_gather_dim == 1
+            and ql_nope.dtype in (torch.bfloat16, torch.float16, torch.float32)
+            and ql_nope.shape[0] > 0
+            and nope_dim > 0
+            and rope_dim > 0
+            and nope_dim & (nope_dim - 1) == 0  # Each fragment uses a full tl.arange vector.
+            and rope_dim & (rope_dim - 1) == 0
+        ):
+            prepared = prepare_query_head_major(ql_nope, q_pe)
+            gathered, handle = all_gather_async(prepared, self.dcp_group)
+            return DCPGatherContext(
+                gathered=gathered,
+                handle=handle,
+                restore_perm=(1, 0, 2),
+                split_sizes=(nope_dim, rope_dim),
+                query_prepared=True,
+            )
+
         # Avoid back-to-back DCP all_gather calls for the two SFA query
         # fragments. On Ascend the separate gathers can leave SFA with an
         # incomplete stream dependency on the first prefill. DSA-CP restores
@@ -1690,9 +1731,9 @@ class AscendSFADCPImpl(DCPImplMixin, AscendSFAImpl):
         assert isinstance(attn_metadata, AscendSFADCPMetadata)
         assert attn_metadata.dcp_context is not None
         slots = attn_metadata.dcp_context.slot_mapping
-        # PCP gathers prefill KV rows; retain their full DCP mapping.
+        # PCP stores gathered KV with the mapping prepared by the builder.
         if isinstance(self, AscendSFAPCPImpl) and self._has_prefill(attn_metadata):
-            return slots
+            return attn_metadata.slot_mapping
         return slots[: attn_metadata.num_input_tokens]
 
     def _store_parallel_kv(
@@ -1978,12 +2019,12 @@ def resolve_sfa_metadata_builder(
     """Resolve one SFA metadata builder from the independent CP switches."""
     dsa_cp_enabled = enable_dsa_cp()
     dcp_enabled = enable_sfa_dcp_replicated_indexer()
-    pcp_enabled = vllm_config is not None and vllm_config.parallel_config.prefill_context_parallel_size > 1
+    use_pcp = vllm_config is not None and vllm_config.parallel_config.prefill_context_parallel_size > 1
     if dsa_cp_enabled and dcp_enabled:
         return AscendSFADSADCPMetadataBuilder
     if dsa_cp_enabled:
         return AscendSFADSACPMetadataBuilder
-    if pcp_enabled and dcp_enabled:
+    if use_pcp and dcp_enabled:
         return AscendSFAPCPDCPMetadataBuilder
     if dcp_enabled:
         return AscendSFADCPMetadataBuilder
@@ -1994,15 +2035,15 @@ def resolve_sfa_impl(vllm_config: VllmConfig | None = None) -> type[AscendSFAImp
     """Resolve one SFA implementation from the independent CP switches."""
     dsa_cp_enabled = enable_dsa_cp()
     dcp_enabled = enable_sfa_dcp_replicated_indexer()
-    pcp_enabled = vllm_config is not None and vllm_config.parallel_config.prefill_context_parallel_size > 1
+    use_pcp = vllm_config is not None and vllm_config.parallel_config.prefill_context_parallel_size > 1
     if dsa_cp_enabled and dcp_enabled:
         return AscendSFADSADCPImpl
     if dsa_cp_enabled:
         return AscendSFADSACPImpl
-    if pcp_enabled and dcp_enabled:
+    if use_pcp and dcp_enabled:
         return AscendSFAPCPDCPImpl
     if dcp_enabled:
         return AscendSFADCPImpl
-    if pcp_enabled:
+    if use_pcp:
         return AscendSFAPCPImpl
     return AscendSFAImpl
