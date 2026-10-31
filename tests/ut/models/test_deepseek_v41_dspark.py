@@ -135,6 +135,11 @@ def test_v41_draft_routes_to_v41(cp):
     with (
         patch.object(DeepseekV41SWAAttention, "__init__", initialize_base),
         patch("vllm_ascend.attention.context_parallel.dsa_v41_cp.enable_dsa_cp", return_value=cp),
+        patch("vllm_ascend.attention.context_parallel.dsa_v41_cp.is_pcp_enabled", return_value=False),
+        patch(
+            "vllm_ascend.attention.dsa_v41.get_ascend_config",
+            return_value=SimpleNamespace(multistream_dsv4_dsa_overlap=False),
+        ),
         patch.object(
             deepseek_v41_dspark_module.DeviceOperator,
             "get_dsv41_packed_cache_ops",
@@ -355,7 +360,18 @@ def test_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
             projection_calls.append(context_states)
             return stacked_output
 
-    attns = [SimpleNamespace(rotary_emb=SimpleNamespace(layername=f"layer-{layer_idx}")) for layer_idx in range(3)]
+    attns = [
+        SimpleNamespace(
+            rotary_emb=SimpleNamespace(layername=f"layer-{layer_idx}"),
+            dsa_attn=SimpleNamespace(swa_cache_layer=SimpleNamespace(prefix=f"mtp.{layer_idx}.self_attn.swa_cache")),
+        )
+        for layer_idx in range(3)
+    ]
+    transfers = []
+    monkeypatch.setattr(
+        deepseek_v41_dspark_module, "wait_for_dsv41_layerwise_kv", lambda n: transfers.append(("wait", n))
+    )
+    monkeypatch.setattr(deepseek_v41_dspark_module, "save_dsv41_layerwise_kv", lambda n: transfers.append(("save", n)))
     layers = {str(layer_idx + 40): SimpleNamespace(self_attn=attn) for layer_idx, attn in enumerate(attns)}
 
     def get_rope(positions, layer_names):
@@ -404,3 +420,4 @@ def test_context_kv_uses_one_stacked_wkv_projection(monkeypatch):
     assert [call[3] for call in projected] == [rope, rope]
     assert stored[0][1] is slot_mappings[0]
     assert stored[1][1] is slot_mappings[2]
+    assert transfers == [(op, f"mtp.{idx}.self_attn.swa_cache") for idx in [0, 2] for op in ["wait", "save"]]

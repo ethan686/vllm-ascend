@@ -408,14 +408,24 @@ def collect_storage_merged_register_regions(
         if tensor is None or tensor.numel() == 0:
             continue
 
-        nbytes = tensor.nbytes
+        if tensor.numel() == 0:
+            continue
+        # Register the full physical page span. Layerwise transfer advances
+        # each block by stride(0), while page-padded DSV4 views expose fewer
+        # logical bytes than the backing allocation.
+        max_offset = sum((size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())) + 1
+        block_slot_span = tensor.shape[0] * tensor.stride(0) if tensor.ndim > 0 else max_offset
+        nbytes = max(max_offset, block_slot_span) * tensor.element_size()
         start = tensor.data_ptr()
         # Strided K/V views can touch bytes beyond their logical payload.
         # Start at the view pointer so storage offsets remain accounted for.
         span_bytes = tensor.element_size() + sum(
             (size - 1) * stride * tensor.element_size() for size, stride in zip(tensor.shape, tensor.stride())
         )
-        end = start + span_bytes
+        # The transfer path advances by physical block stride, so the
+        # registered interval must cover the complete page-padded span rather
+        # than only the last logically addressed element.
+        end = start + max(span_bytes, nbytes)
         storage_key = tensor_storage_key(tensor)
 
         logical_tensor_count += 1
