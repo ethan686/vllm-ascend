@@ -36,7 +36,12 @@ from vllm.platforms import current_platform
 
 from vllm_ascend.attention.context_parallel.dsa_v41_cp import get_v41_cp_classes
 from vllm_ascend.attention.dsa_v1 import AscendDSAImpl, OProjBufferPool
-from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheBackend, scatter_cache_sk
+from vllm_ascend.attention.dsa_v41 import (
+    DeepseekV41CacheBackend,
+    save_dsv41_layerwise_kv,
+    scatter_cache_sk,
+    wait_for_dsv41_layerwise_kv,
+)
 from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.models.common.ops.sequence_parallel import (
@@ -350,8 +355,13 @@ class DeepseekV41DSparkModel(torch.nn.Module):
             if layer_context_slot_mapping is None:
                 continue
             attn = layer.self_attn
+            cache_name = attn.dsa_attn.swa_cache_layer.prefix
+            wait_for_dsv41_layerwise_kv(cache_name)
             shared_kv = self._project_shared_kv(kv, context_positions, attn, rope=rope)
             self._store_standard_swa_kv(shared_kv, layer_context_slot_mapping, attn)
+            # All draft context caches participate in PD transfer, even when
+            # the P request only generates its single handoff token.
+            save_dsv41_layerwise_kv(cache_name)
 
     def hc_head(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         shape, dtype = x.size(), x.dtype
