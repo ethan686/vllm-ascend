@@ -1,0 +1,6 @@
+pr: 1
+entries:
+  - category: feature
+    text: Added DeepSeek V4.1 support for Mooncake layerwise prefill/decode disaggregation, including compressor state and DSpark caches.
+    model: deepseek-v4.1
+    hardware: [A3]
